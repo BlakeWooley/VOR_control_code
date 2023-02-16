@@ -181,22 +181,22 @@ void indicator_deflection_update(){
   //set bounds from 180 to -180 for the comparison
   if(RADIAL_COMPARE < -180) RADIAL_COMPARE += 360;
   else if(RADIAL_COMPARE > 180) RADIAL_COMPARE -= 360;
-  //create the FROM arrow
+  //create the TO arrow
   if(RADIAL_COMPARE > 90 || RADIAL_COMPARE < -90){
     if(indicator_lock == 1){
       indicator.fillSprite(0); //erase the indicator
-      indicator.fillTriangle(0,0,24,0,12,20,12); //draw down arrow
+      indicator.fillTriangle(0,20,24,20,12,0,12); //draw up arrow
       indicator.pushSprite(180,60); //push the indicator to the display
       indicator_lock = 0;
     }
     if(RADIAL_COMPARE > 90) DEFLECTION = -1 * RADIAL_COMPARE + 180;
     else if(RADIAL_COMPARE < -90) DEFLECTION = -1* RADIAL_COMPARE - 180;
   }
-  //create the TO arrow
+  //create the FROM arrow
   else if(RADIAL_COMPARE < 90 && RADIAL_COMPARE > -90){
     if(indicator_lock == 0){
       indicator.fillSprite(0); //erase the indicator
-      indicator.fillTriangle(0,20,24,20,12,0,12); //draw up arrow
+      indicator.fillTriangle(0,0,24,0,12,20,12); //draw down arrow
       indicator.pushSprite(180,60); //push the indicator to the display
       indicator_lock = 1;
     }

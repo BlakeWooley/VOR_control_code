@@ -42,7 +42,7 @@ uint16_t indicator_lock = 0;
 uint16_t R_ENCODER_LD = 21;
 //const int spiClk = 1000000; // 1 MHz
 const int spiClk = 50000; // 50 kHz spi clock speed
-SPIClass * vspi = NULL;
+SPIClass& vspi = SPI;
 //==========================================================================================
 void startup_screen(){
   //draw the disc in the center of the screen
@@ -88,10 +88,10 @@ void get_user_input(){
   	PORTD &= !(1<<PORTD2); //set PORTD bit 2 low - falling edge for HC595 storage register
   }*/
   //rotary_data = SPDR; //grabs the data received over MISO
-  vspi->beginTransaction(SPISettings(spiClk, MSBFIRST, SPI_MODE0));
-  rotary_data = vspi->transfer(0xFF); //0xFF is just a dummy
-  vspi->endTransaction();
-  rotary_data &= 0x03; //keep the last two bits, the rest is garbage
+  vspi.beginTransaction(SPISettings(spiClk, MSBFIRST, SPI_MODE0));
+  rotary_data = vspi.transfer(0xFF); //0xFF is just a dummy
+  vspi.endTransaction();
+  //rotary_data &= 0x03; //keep the last two bits, the rest is garbage
 
   if (rotary_data_lock == 0x00 || rotary_data == 0x00) rotary_data_lock = rotary_data; //resets on 0x00, otherwise gets the first rising edge
   static const uint16_t rotary_increment = 5;
@@ -242,8 +242,9 @@ void setup() {
   pinMode(R_ENCODER_LD, OUTPUT);
 
   //get vspi ready
+  /*
   vspi = new SPIClass(VSPI);
-  vspi->begin();
+  vspi->begin();*/
 
   // Populate the palette table, table must have 16 entries
   palette[0]  = TFT_BLACK;
@@ -264,15 +265,14 @@ void setup() {
   palette[15] = TFT_WHITE;
 
   //Serial.begin(250000);
-  sprite_setup(); 
+  sprite_setup();
+  vspi = tft.getSPIinstance();
   startup_screen();
 }
 //==========================================================================================
 void loop() {
-  //for testing
-  testing();
-
-  //get_user_input(); //fetches any new information supplied by the user
+  //testing();
+  get_user_input(); //fetches any new information supplied by the user
 
   indicator_deflection_update();
   
