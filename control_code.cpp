@@ -7,11 +7,16 @@ Date: 01-31-2023
 /* DEVNOTES
 -need to use color palette for sprites or they won't work
 -don't try to fillScreen the tft, it flickers terribly
+-maybe writing that garbage to VSPI with the CS weirdness is a bad idea, probably caused the corruptions
 */
 
 #include <TFT_eSPI.h>
-//#include <SPI.h>
-//#include <string>
+#include <SPI.h>
+
+//#define VSPI_MISO 19
+//#define VSPI_MOSI 23
+//#define VSPI_SCLK 18
+//#define VSPI_SS 5
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite background = TFT_eSprite(&tft); // Sprite object background
@@ -19,14 +24,25 @@ TFT_eSprite dial = TFT_eSprite(&tft); // Sprite object dial
 TFT_eSprite needle = TFT_eSprite(&tft); // Sprite object needle
 TFT_eSprite startup_disc = TFT_eSprite(&tft); // Sprite object startup_disc
 TFT_eSprite startup_text = TFT_eSprite(&tft); // Sprite object startup_text
+TFT_eSprite sradial_text = TFT_eSprite(&tft); // Sprite object sradial
+TFT_eSprite tradial_text = TFT_eSprite(&tft); // Sprite object tradial
+TFT_eSprite indicator = TFT_eSprite(&tft); // Sprite object sradial
+
 // Palette colour table
 uint16_t palette[16];
-uint16_t DEFLECTION;
-uint16_t DEFLECTION_POS = 0;
-uint16_t CURRENT_DEFLECTION_POS = 0;
-uint16_t SET_RADIAL;
-uint16_t TRUE_RADIAL;
+int16_t DEFLECTION = 0; //has a range of -90 to 90 degrees
+int16_t DEFLECTION_POS = 40; //has a range of 0 to 80 pixels, where the needle should be
+uint16_t CURRENT_DEFLECTION_POS = 40; //where the needle is now
+int16_t SET_RADIAL = 0; //must be signed for comparisons
+int16_t TRUE_RADIAL = 0; //must be signed for comparisons
+int16_t RADIAL_COMPARE = 0; //compares TRUE_RADIAL and SET_RADIAL
 uint16_t tempval = 0;
+uint16_t tempval2 = 0;
+uint16_t indicator_lock = 0;
+uint16_t R_ENCODER_LD = 21;
+//const int spiClk = 1000000; // 1 MHz
+const int spiClk = 50000; // 50 kHz spi clock speed
+SPIClass * vspi = NULL;
 //==========================================================================================
 void startup_screen(){
   //draw the disc in the center of the screen
@@ -40,10 +56,6 @@ void startup_screen(){
   delay(500);
   //move the disc to the left
   for(uint16_t i=0; i<40; i++){
-    //background.fillSprite(TFT_BLACK);
-    //startup_disc.pushToSprite(&background,60-i,20,TFT_BLACK);
-    //background.pushSprite(0,0,TFT_BLACK);
-    //tft.fillScreen(TFT_BLACK);
     startup_disc.scroll(-1,0);
     startup_disc.pushSprite(20,20);
     delay(1);
@@ -57,32 +69,170 @@ void startup_screen(){
   startup_disc.deleteSprite();
   startup_text.deleteSprite();
 }
+//==========================================================================================
+void get_user_input(){
+  //now read the rotation of the encoder from SPI
+  digitalWrite(R_ENCODER_LD, LOW); //set GPIO21 low
+  digitalWrite(R_ENCODER_LD, HIGH); //set GPIO21 high again, completing the parallel shift into the HC165
+  static uint8_t rotary_data; //holds the serial data from the HC165
+  static uint8_t rotary_data_lock; //captures the first rising edge from the rotary encoder
 
-void screen_init(){
-    //draw white outer circle with no fill, radius=100, center=(160, 120)
-    background.drawCircle(160, 120, 100, 15);
-    //draw white inner circle with no fill, radius=80, center=(160, 120)
-    background.drawCircle(160, 120, 80, 15);
-    //draw white center circle for needle
-    background.drawCircle(160, 120, 5, 15);
-    //draw yellow needle at center position with height=120
-    //tft.drawFastVLine(160, 60, 120, TFT_YELLOW);
-    //draw the white deflection dashes, each indicating 2 degrees of deflection
-    background.drawFastVLine(120, 110, 20, 15);
-    background.drawFastVLine(130, 110, 20, 15);
-    background.drawFastVLine(140, 110, 20, 15);
-    background.drawFastVLine(150, 110, 20, 15);
-    background.drawFastVLine(170, 110, 20, 15);
-    background.drawFastVLine(180, 110, 20, 15);
-    background.drawFastVLine(190, 110, 20, 15);
-    background.drawFastVLine(200, 110, 20, 15);
+  vspi->beginTransaction(SPISettings(spiClk, MSBFIRST, SPI_MODE0));
+  rotary_data = vspi->transfer(0xFF); //0xFF is just a dummy
+  vspi->endTransaction();
+  rotary_data &= 0x03; //keep the last two bits, the rest is garbage
+
+  if (rotary_data_lock == 0x00 || rotary_data == 0x00) rotary_data_lock = rotary_data; //resets on 0x00, otherwise gets the first rising edge
+  static const uint16_t rotary_increment = 5;
+  //increment/decrement the count based on the direction of rotation of the encoder
+  if(rotary_data == 0x02 && rotary_data_lock == 0x01){
+    SET_RADIAL -= rotary_increment; //decrement the set radial
+    if(SET_RADIAL < 0) SET_RADIAL += 360; //range of 0-359, allow wrapping around
+	rotary_data_lock = 0x00; //reset the lock to prevent more than one decrement when hung on 0x02
+  }
+  else if(rotary_data == 0x01 && rotary_data_lock == 0x02){
+    SET_RADIAL += rotary_increment; //increment the set radial
+    if(SET_RADIAL > 359) SET_RADIAL = 0; //range of 0-359, allow wrapping around
+	rotary_data_lock = 0x00; //reset the lock to prevent more than on increment when hung on 0x01
+  }
 }
-
-void setup() {
-  //Serial.begin(250000);
+//==========================================================================================
+//this function gets every sprite set up
+void sprite_setup(){
+  //get the tft object set up
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
+
+  //create a sprite for the background
+  background.setColorDepth(4);
+  background.createSprite(320, 240); //always want to add 1 to all dimensions
+  background.createPalette(palette);
+  background.fillSprite(0); // Fill sprite with palette colour 9 (blue in this example)
+  //draw white outer circle with no fill, radius=100, center=(160, 120)
+  background.fillCircle(160, 120, 100, 13);
+  //draw white inner circle with no fill, radius=80, center=(160, 120)
+  background.fillCircle(160, 120, 80, 0);
+  //draw white center circle for needle
+  background.drawCircle(160, 120, 5, 15);
+  //draw the white deflection dashes, each indicating 2 degrees of deflection
+  background.drawFastVLine(120, 110, 20, 15);
+  background.drawFastVLine(130, 110, 20, 15);
+  background.drawFastVLine(140, 110, 20, 15);
+  background.drawFastVLine(150, 110, 20, 15);
+  background.drawFastVLine(170, 110, 20, 15);
+  background.drawFastVLine(180, 110, 20, 15);
+  background.drawFastVLine(190, 110, 20, 15);
+  background.drawFastVLine(200, 110, 20, 15);
+
+  //create a sprite for the needle
+  needle.setColorDepth(4);
+  needle.createSprite(82, 120); //gonna need to add two pixels to the width
+  needle.createPalette(palette);
+  needle.fillSprite(0); // Note: Sprite is filled with palette[0] colour when created
+  //needle.drawFastVLine(0,0,120,14); //scroll doesn't like single pixel lines, i guess?
+  needle.fillRect(0,0,3,120,14);
+  needle.setScrollRect(0,0,3,120,0);
+
+  //create a sprite for the scrolling numbers
+  startup_disc.setColorDepth(4);
+  startup_disc.createSprite(241, 201); //always want to add 1 to all dimensions
+  startup_disc.createPalette(palette);
+  startup_disc.fillSprite(0); // Fill sprite with palette colour 9 (blue in this example)
+
+  //create a sprite for the scrolling numbers
+  startup_text.setColorDepth(4);
+  startup_text.createSprite(101, 64);
+  startup_text.createPalette(palette);
+  startup_text.fillSprite(0); // Fill sprite with black
+  startup_text.setTextColor(4); // maroon text, no background
+  startup_text.drawString("VOR",0,0,4); // Draw string using font 4
+  startup_text.drawString("Reader",0,30,4);
+
+  //create the set radial text
+  sradial_text.setColorDepth(4);
+  sradial_text.createSprite(50, 50); //always want to add 1 to all dimensions
+  sradial_text.createPalette(palette);
+  sradial_text.fillSprite(0); // Fill sprite with palette colour 9 (blue in this example)
+  sradial_text.setTextColor(11); // cyan text, no background
+  sradial_text.drawString("SET",0,0,4); // Draw string using font 4
+  sradial_text.drawString(String(SET_RADIAL),0,25,4); // Draw string using font 4
+
+  //create the true radial text
+  tradial_text.setColorDepth(4);
+  tradial_text.createSprite(50, 50); //always want to add 1 to all dimensions
+  tradial_text.createPalette(palette);
+  tradial_text.fillSprite(0); // Fill sprite with palette colour 9 (blue in this example)
+  tradial_text.setTextColor(11); // cyan text, no background
+  tradial_text.drawString("ON",0,0,4); // Draw string using font 4
+  tradial_text.drawString(String(TRUE_RADIAL),0,25,4); // Draw string using font 4
+  
+  //create the to/from indicator
+  indicator.setColorDepth(4);
+  indicator.createSprite(25, 21);
+  indicator.createPalette(palette);
+  indicator.fillSprite(0); // Fill sprite with black
+  indicator.fillTriangle(0,20,24,20,12,0,12);
+}
+//==========================================================================================
+void indicator_deflection_update(){
+  //compare the two radial values
+  RADIAL_COMPARE = SET_RADIAL - TRUE_RADIAL;
+  //set bounds from 180 to -180 for the comparison
+  if(RADIAL_COMPARE < -180) RADIAL_COMPARE += 360;
+  else if(RADIAL_COMPARE > 180) RADIAL_COMPARE -= 360;
+  //create the FROM arrow
+  if(RADIAL_COMPARE > 90 || RADIAL_COMPARE < -90){
+    if(indicator_lock == 1){
+      indicator.fillSprite(0); //erase the indicator
+      indicator.fillTriangle(0,0,24,0,12,20,12); //draw down arrow
+      indicator.pushSprite(180,60); //push the indicator to the display
+      indicator_lock = 0;
+    }
+    if(RADIAL_COMPARE > 90) DEFLECTION = -1 * RADIAL_COMPARE + 180;
+    else if(RADIAL_COMPARE < -90) DEFLECTION = -1* RADIAL_COMPARE - 180;
+  }
+  //create the TO arrow
+  else if(RADIAL_COMPARE < 90 && RADIAL_COMPARE > -90){
+    if(indicator_lock == 0){
+      indicator.fillSprite(0); //erase the indicator
+      indicator.fillTriangle(0,20,24,20,12,0,12); //draw up arrow
+      indicator.pushSprite(180,60); //push the indicator to the display
+      indicator_lock = 1;
+    }
+    DEFLECTION = RADIAL_COMPARE;
+  }
+  //calculate the pixel location for the deflection
+  DEFLECTION_POS = (DEFLECTION * 5) + 40; //5 pixels per degree, centered on pixel 40
+  //place bounds on the maximum and minimum deflection position
+  if(DEFLECTION_POS > 80) DEFLECTION_POS = 80;
+  else if(DEFLECTION_POS < 0) DEFLECTION_POS = 0;
+}
+//==========================================================================================
+void testing(){
+  tempval2++;
+  if(tempval2 == 10){
+    if(tempval<180) TRUE_RADIAL++;
+    else if(tempval>=200 && tempval<380) SET_RADIAL++;
+    else if(tempval>=400 && tempval<580) TRUE_RADIAL++;
+    else if(tempval>=580 && tempval<760) SET_RADIAL--;
+    
+    if(tempval<760) tempval++;
+    else if(tempval >= 760) tempval = 0;
+    
+    tempval2 = 0;
+  }
+  if(TRUE_RADIAL >= 360) TRUE_RADIAL = 0;
+  else if(SET_RADIAL >= 360) SET_RADIAL = 0;
+}
+//==========================================================================================
+void setup() {
+  //set GPIO21 as an output for rotary encoder
+  pinMode(R_ENCODER_LD, OUTPUT);
+
+  //get vspi ready
+  vspi = new SPIClass(VSPI);
+  vspi->begin();
 
   // Populate the palette table, table must have 16 entries
   palette[0]  = TFT_BLACK;
@@ -100,127 +250,47 @@ void setup() {
   palette[12] = TFT_RED;
   palette[13] = TFT_NAVY;
   palette[14] = TFT_YELLOW;
-  palette[15] = TFT_WHITE; 
+  palette[15] = TFT_WHITE;
 
-  // Create a sprite for the background
-  background.setColorDepth(4);
-  background.createSprite(320, 240); //always want to add 1 to all dimensions
-  background.createPalette(palette);
-  background.fillSprite(0); // Fill sprite with palette colour 9 (blue in this example)
-
-  // Create a sprite for the needle
-  //ok so we could draw the sprite first and then redraw any markers that are within range of CURRENT_DEFLECTION_POS, would prefer markers on top of needle if it's 3 pixels thick
-  needle.setColorDepth(4);
-  needle.createSprite(82, 120); //gonna need to add two pixels to the width
-  needle.createPalette(palette);
-  needle.fillSprite(0); // Note: Sprite is filled with palette[0] colour when created
-  //needle.drawFastVLine(0,0,120,14); //scroll doesn't like single pixel lines, i guess?
-  needle.fillRect(0,0,3,120,14);
-  needle.setScrollRect(0,0,3,120,0),
-/*
-  // Create a sprite for the needle
-  //ok so we could draw the sprite first and then redraw any markers that are within range of CURRENT_DEFLECTION_POS, would prefer markers on top of needle if it's 3 pixels thick
-  needle.setColorDepth(4);
-  needle.createSprite(3, 121); //gonna need to add two pixels to the width
-  needle.createPalette(palette);
-  needle.fillSprite(0); // Note: Sprite is filled with black
-  needle.drawFastVLine(1,0,120,14);
-*/
-  // Create a sprite for the scrolling numbers
-  startup_disc.setColorDepth(4);
-  startup_disc.createSprite(241, 201); //always want to add 1 to all dimensions
-  startup_disc.createPalette(palette);
-  startup_disc.fillSprite(0); // Fill sprite with palette colour 9 (blue in this example)
-
-  // Create a sprite for the scrolling numbers
-  startup_text.setColorDepth(4);
-  startup_text.createSprite(101, 64);
-  startup_text.createPalette(palette);
-  startup_text.fillSprite(0); // Fill sprite with black
-  startup_text.setTextColor(4); // maroon text, no background
-  startup_text.drawString("VOR",0,0,4); // Draw string using font 4
-  startup_text.drawString("Reader",0,30,4);
-
+  //Serial.begin(250000);
+  sprite_setup(); 
   startup_screen();
-  screen_init();
 }
-
 //==========================================================================================
 void loop() {
-  //DEFLECTION = SET_RADIAL - TRUE_RADIAL;
-  
   //for testing
-  tempval++;
-  if(tempval<80) DEFLECTION_POS++;
-  else if(tempval<160) DEFLECTION_POS--;
-  else tempval = 0;
+  testing();
 
-  //place bounds on the maximum and minimum deflection position
-  if(DEFLECTION_POS > 80) DEFLECTION_POS = 80;
-  else if(DEFLECTION_POS < 0) DEFLECTION_POS = 0;
-  tft.fillRect(119 + CURRENT_DEFLECTION_POS,60,3,120,TFT_BLACK);
+  //get_user_input(); //fetches any new information supplied by the user
+
+  indicator_deflection_update();
+  
   //make the needle move to the left or right
   if(DEFLECTION_POS > CURRENT_DEFLECTION_POS){
     //needle.scroll(1,0);
+    tft.fillRect(119 + CURRENT_DEFLECTION_POS,60,3,120,TFT_BLACK); //erase the needle with a black rectangle
+    indicator.pushSprite(180,60); //push the indicator to the display whenever the needle changes position
     CURRENT_DEFLECTION_POS++;
   }
   else if(DEFLECTION_POS < CURRENT_DEFLECTION_POS){
     //needle.scroll(-1,0);
+    tft.fillRect(119 + CURRENT_DEFLECTION_POS,60,3,120,TFT_BLACK); //erase the needle with a black rectangle
+    indicator.pushSprite(180,60); //push the indicator to the display whenever the needle changes position
     CURRENT_DEFLECTION_POS--;
   }
+
+  //redraw the needle at the correct position
   tft.fillRect(119 + CURRENT_DEFLECTION_POS,60,3,120,TFT_YELLOW);
 
-  //make the sprite show up
-  //needle.pushSprite(119,60);
-  //needle.pushSprite(119 + CURRENT_DEFLECTION_POS,60);
-
-  //redraw any affected deflection indicators
-  /*
-  if(CURRENT_DEFLECTION_POS <= 1) background.drawFastVLine(120, 110, 20, 15);
-  else if(CURRENT_DEFLECTION_POS >= 9 || CURRENT_DEFLECTION_POS <= 11) background.drawFastVLine(130, 110, 20, 15);
-  else if(CURRENT_DEFLECTION_POS = 19 || CURRENT_DEFLECTION_POS <= 21) background.drawFastVLine(140, 110, 20, 15);
-  else if(CURRENT_DEFLECTION_POS = 29) background.drawFastVLine(150, 110, 20, 15);
-  else if(CURRENT_DEFLECTION_POS = 39)
-  else if(CURRENT_DEFLECTION_POS = 49) background.drawFastVLine(170, 110, 20, 15);
-  else if(CURRENT_DEFLECTION_POS = 59) background.drawFastVLine(180, 110, 20, 15);
-  else if(CURRENT_DEFLECTION_POS = 69) background.drawFastVLine(190, 110, 20, 15);
-  else if(CURRENT_DEFLECTION_POS >= 79) background.drawFastVLine(200, 110, 20, 15);
-  */
+  //update some sprites
   background.pushSprite(0,0,0);
-
-  delay(200);
+  sradial_text.fillRect(0,25,50,25,0); //erase the old set radial text
+  sradial_text.drawString(String(SET_RADIAL),0,25,4); // Draw string using font 4
+  sradial_text.pushSprite(270,0);
+  tradial_text.fillRect(0,25,50,25,0); //erase the old set radial text
+  tradial_text.drawString(String(TRUE_RADIAL),0,25,4); // Draw string using font 4
+  tradial_text.pushSprite(0,0);
+  
+  //delay(1);
 }
-
-  /*
-  // Draw point in needle sprite at far right edge (this will scroll left later)
-  dial.drawCircle(100,100,80,15);
-  needle.drawFastVLine(160,80,120,);
-  //Push the sprites onto the TFT at specified coordinates
-  //needle.pushToSprite(&startup_disc, 0, 0, TFT_BLACK);
-  needle.pushSprite(0,0,0);
-  dial.pushSprite(0,0,0);
-
-  THIS WORKED
-  needle.drawCircle(100,100,80,TFT_WHITE); 
-  startup_disc.drawCircle(100,100,50,TFT_WHITE);
-  needle.pushSprite(0,0,TFT_BLACK);
-  startup_disc.pushSprite(0,0,TFT_BLACK);
-
-  THIS WORKED
-  needle.drawCircle(100,100,100,TFT_WHITE); 
-  startup_disc.drawCircle(100,100,80,TFT_WHITE);
-  startup_disc.pushSprite(0,0,TFT_BLACK);
-  needle.pushSprite(0,0,TFT_BLACK);
-
-  THIS WORKED
-  needle.drawCircle(100,100,100,TFT_WHITE); 
-  startup_disc.drawCircle(100,100,DEFLECTION_POS,TFT_WHITE);
-  startup_disc.pushSprite(0,0,TFT_BLACK);
-  needle.pushSprite(0,0,TFT_BLACK);
-
-  THIS DIDN'T WORK
-  needle.drawCircle(100,100,80,TFT_WHITE); 
-  startup_disc.drawCircle(100,100,60,TFT_WHITE);
-  startup_disc.pushToSprite(&needle,0,0,TFT_BLACK);
-  needle.pushSprite(0,0,TFT_BLACK);
-  */
+//==========================================================================================
